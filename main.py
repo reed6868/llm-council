@@ -1,5 +1,8 @@
+from backend.cli import main as cli_main
+
+
 def main():
-    print("Hello from llm-council!")
+    cli_main()
 
 
 if __name__ == "__main__":

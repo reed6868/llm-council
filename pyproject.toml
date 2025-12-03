@@ -10,4 +10,9 @@ dependencies = [
     "python-dotenv>=1.0.0",
     "httpx>=0.27.0",
     "pydantic>=2.9.0",
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
 ]
+
+[project.scripts]
+llm-council = "backend.cli:main"

@@ -1,11 +1,16 @@
 """3-stage LLM Council orchestration."""
 
-from typing import List, Dict, Any, Tuple
-from .openrouter import query_models_parallel, query_model
-from .config import COUNCIL_MODELS, CHAIRMAN_MODEL
+from typing import List, Dict, Any, Tuple, Optional
+
+from .llm_client import query_models_parallel, query_model
+from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, TITLE_MODEL
+from .council_config import load_council_config
 
 
-async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
+async def stage1_collect_responses(
+    user_query: str,
+    models: Optional[List[str]] = None,
+) -> List[Dict[str, Any]]:
     """
     Stage 1: Collect individual responses from all council models.
 
@@ -17,8 +22,11 @@ async def stage1_collect_responses(user_query: str) -> List[Dict[str, Any]]:
     """
     messages = [{"role": "user", "content": user_query}]
 
+    # Allow callers to override the model list (e.g. after validation).
+    models_to_use = models if models is not None else COUNCIL_MODELS
+
     # Query all models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    responses = await query_models_parallel(models_to_use, messages)
 
     # Format results
     stage1_results = []
@@ -94,8 +102,11 @@ Now provide your evaluation and ranking:"""
 
     messages = [{"role": "user", "content": ranking_prompt}]
 
-    # Get rankings from all council models in parallel
-    responses = await query_models_parallel(COUNCIL_MODELS, messages)
+    # Only ask models that produced a successful Stage 1 response to rank
+    ranking_models = [result["model"] for result in stage1_results]
+
+    # Get rankings from all successful council models in parallel
+    responses = await query_models_parallel(ranking_models, messages)
 
     # Format results
     stage2_results = []
@@ -115,7 +126,8 @@ Now provide your evaluation and ranking:"""
 async def stage3_synthesize_final(
     user_query: str,
     stage1_results: List[Dict[str, Any]],
-    stage2_results: List[Dict[str, Any]]
+    stage2_results: List[Dict[str, Any]],
+    chairman_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Stage 3: Chairman synthesizes final response.
@@ -158,18 +170,21 @@ Provide a clear, well-reasoned final answer that represents the council's collec
 
     messages = [{"role": "user", "content": chairman_prompt}]
 
+    # Determine which model acts as chairman for this call.
+    effective_chairman = chairman_model or CHAIRMAN_MODEL
+
     # Query the chairman model
-    response = await query_model(CHAIRMAN_MODEL, messages)
+    response = await query_model(effective_chairman, messages)
 
     if response is None:
         # Fallback if chairman fails
         return {
-            "model": CHAIRMAN_MODEL,
+            "model": effective_chairman,
             "response": "Error: Unable to generate final synthesis."
         }
 
     return {
-        "model": CHAIRMAN_MODEL,
+        "model": effective_chairman,
         "response": response.get('content', '')
     }
 
@@ -274,11 +289,15 @@ Title:"""
 
     messages = [{"role": "user", "content": title_prompt}]
 
-    # Use gemini-2.5-flash for title generation (fast and cheap)
-    response = await query_model("google/gemini-2.5-flash", messages, timeout=30.0)
+    cfg = load_council_config()
+    effective_title_model = cfg.title_model or TITLE_MODEL
+
+    if not effective_title_model:
+        return "New Conversation"
+
+    response = await query_model(effective_title_model, messages, timeout=30.0)
 
     if response is None:
-        # Fallback to a generic title
         return "New Conversation"
 
     title = response.get('content', 'New Conversation').strip()
@@ -303,18 +322,59 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     Returns:
         Tuple of (stage1_results, stage2_results, stage3_result, metadata)
     """
-    # Stage 1: Collect individual responses
-    stage1_results = await stage1_collect_responses(user_query)
+    cfg = load_council_config()
+
+    # If there are no valid council models at all, short-circuit with a clear error.
+    if not cfg.council_models:
+        return [], [], {
+            "model": "error",
+            "response": "All models failed to respond. Please check LLM_COUNCIL_MODELS and API keys."
+        }, {
+            "failures": cfg.failures,
+            "runtime_failures": [],
+        }
+
+    runtime_failures = []
+
+    # Stage 1: Collect individual responses from the effective council models.
+    stage1_results = await stage1_collect_responses(user_query, models=cfg.council_models)
+
+    # Track models that failed to produce a Stage 1 response at runtime.
+    stage1_models = [result["model"] for result in stage1_results]
+    for spec in cfg.council_models:
+        if spec not in stage1_models:
+            runtime_failures.append(
+                {
+                    "model_spec": spec,
+                    "stage": "stage1",
+                    "error_type": "runtime_failure",
+                }
+            )
 
     # If no models responded successfully, return error
     if not stage1_results:
         return [], [], {
             "model": "error",
             "response": "All models failed to respond. Please try again."
-        }, {}
+        }, {
+            "failures": cfg.failures,
+            "runtime_failures": runtime_failures,
+        }
 
     # Stage 2: Collect rankings
     stage2_results, label_to_model = await stage2_collect_rankings(user_query, stage1_results)
+
+    # Track models that succeeded in Stage 1 but failed in Stage 2.
+    stage2_models = [result["model"] for result in stage2_results]
+    for spec in stage1_models:
+        if spec not in stage2_models:
+            runtime_failures.append(
+                {
+                    "model_spec": spec,
+                    "stage": "stage2",
+                    "error_type": "runtime_failure",
+                }
+            )
 
     # Calculate aggregate rankings
     aggregate_rankings = calculate_aggregate_rankings(stage2_results, label_to_model)
@@ -323,13 +383,16 @@ async def run_full_council(user_query: str) -> Tuple[List, List, Dict, Dict]:
     stage3_result = await stage3_synthesize_final(
         user_query,
         stage1_results,
-        stage2_results
+        stage2_results,
+        chairman_model=cfg.chairman_model,
     )
 
     # Prepare metadata
     metadata = {
         "label_to_model": label_to_model,
-        "aggregate_rankings": aggregate_rankings
+        "aggregate_rankings": aggregate_rankings,
+        "failures": cfg.failures,
+        "runtime_failures": runtime_failures,
     }
 
     return stage1_results, stage2_results, stage3_result, metadata

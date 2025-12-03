@@ -77,6 +77,15 @@ def save_conversation(conversation: Dict[str, Any]):
     with open(path, 'w') as f:
         json.dump(conversation, f, indent=2)
 
+    # Best-effort: also write a Markdown transcript for easier inspection.
+    try:
+        from . import transcripts
+
+        transcripts.write_markdown_transcript(conversation)
+    except Exception as e:
+        # Do not fail the main save path if transcript generation fails.
+        print(f"Warning: failed to write transcript for conversation {conversation['id']}: {e}")
+
 
 def list_conversations() -> List[Dict[str, Any]]:
     """
