@@ -76,8 +76,22 @@ def _missing_env_for_provider(provider: str) -> List[str]:
             missing.append("GROK_API_BASE")
         return missing
 
-    # Unknown providers are treated as-is; we do not know the required env vars.
+    # Unknown providers are treated as misconfigured so that typos like
+    # "google:gemini-3-pro-preview" are surfaced during configuration
+    # rather than causing HTTP 400 errors at runtime.
+    missing.append(f"UNSUPPORTED_PROVIDER:{provider}")
     return missing
+
+
+def _normalize_model_spec(spec: str) -> str:
+    """Normalize a raw model spec.
+
+    Currently this only trims whitespace so that higher-level code can
+    rely on consistent formatting. Routing decisions remain explicit:
+    - "anthropic/..." always goes through OpenRouter
+    - "anthropic:..." always uses the direct Anthropic API
+    """
+    return spec.strip()
 
 
 def load_council_config() -> CouncilEffectiveConfig:
@@ -87,32 +101,34 @@ def load_council_config() -> CouncilEffectiveConfig:
 
     # Filter council models by provider-level configuration.
     for spec in config.COUNCIL_MODELS:
-        provider, _ = parse_model_spec(spec)
+        normalized_spec = _normalize_model_spec(spec)
+        provider, _ = parse_model_spec(normalized_spec)
         missing = _missing_env_for_provider(provider)
         if missing:
             failures.append(
                 {
-                    "model_spec": spec,
+                    "model_spec": normalized_spec,
                     "provider": provider,
                     "error_type": "config_error",
                     "missing": missing,
                 }
             )
             continue
-        effective_models.append(spec)
+        effective_models.append(normalized_spec)
 
     # Determine chairman model based on effective models.
     chairman_model: Optional[str] = None
     explicit_chairman = config.CHAIRMAN_MODEL
+    normalized_chairman = _normalize_model_spec(explicit_chairman) if explicit_chairman else None
     if effective_models:
-        if explicit_chairman and explicit_chairman in effective_models:
-            chairman_model = explicit_chairman
-        elif explicit_chairman and explicit_chairman not in effective_models:
+        if normalized_chairman and normalized_chairman in effective_models:
+            chairman_model = normalized_chairman
+        elif normalized_chairman and normalized_chairman not in effective_models:
             # Env points to a model that is not in the effective set.
             failures.append(
                 {
                     "model_spec": explicit_chairman,
-                    "provider": parse_model_spec(explicit_chairman)[0],
+                    "provider": parse_model_spec(normalized_chairman)[0],
                     "error_type": "invalid_chairman",
                     "missing": [],
                 }
@@ -122,14 +138,15 @@ def load_council_config() -> CouncilEffectiveConfig:
             chairman_model = effective_models[0]
 
     # Determine title model; if misconfigured, fall back to chairman.
-    title_model: Optional[str] = config.TITLE_MODEL
+    raw_title: Optional[str] = config.TITLE_MODEL
+    title_model: Optional[str] = _normalize_model_spec(raw_title) if raw_title else None
     if title_model:
         provider, _ = parse_model_spec(title_model)
         missing = _missing_env_for_provider(provider)
         if missing:
             failures.append(
                 {
-                    "model_spec": title_model,
+                    "model_spec": raw_title,
                     "provider": provider,
                     "error_type": "config_error",
                     "missing": missing,
@@ -145,4 +162,3 @@ def load_council_config() -> CouncilEffectiveConfig:
         title_model=title_model,
         failures=failures,
     )
-

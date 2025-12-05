@@ -1,16 +1,25 @@
 """FastAPI backend for LLM Council."""
 
+import uuid
+import json
+import asyncio
+from typing import List, Dict, Any
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
-from typing import List, Dict, Any
-import uuid
-import json
-import asyncio
 
 from . import storage
-from .council import run_full_council, generate_conversation_title, stage1_collect_responses, stage2_collect_rankings, stage3_synthesize_final, calculate_aggregate_rankings
+from .council import (
+    run_full_council,
+    generate_conversation_title,
+    stage1_collect_responses,
+    stage2_collect_rankings,
+    stage3_synthesize_final,
+    calculate_aggregate_rankings,
+)
+from .cli import prepare_council_input
 
 app = FastAPI(title="LLM Council API")
 
@@ -101,9 +110,13 @@ async def send_message(conversation_id: str, request: SendMessageRequest):
         title = await generate_conversation_title(request.content)
         storage.update_conversation_title(conversation_id, title)
 
+    # Prepare the full council input so that HTTP entrypoints share the
+    # same project-context + placeholder handling behaviour as the CLI.
+    council_input = prepare_council_input(request.content, is_first_message)
+
     # Run the 3-stage council process
     stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-        request.content
+        council_input
     )
 
     # Add assistant message with all stages
@@ -146,11 +159,14 @@ async def send_message_stream(conversation_id: str, request: SendMessageRequest)
             if is_first_message:
                 title_task = asyncio.create_task(generate_conversation_title(request.content))
 
+            # Prepare the full council input to mirror CLI behaviour.
+            council_input = prepare_council_input(request.content, is_first_message)
+
             # Run the unified 3-stage council process so that all HTTP/CLI
             # entrypoints share the same orchestration and configuration.
             yield f"data: {json.dumps({'type': 'stage1_start'})}\n\n"
             stage1_results, stage2_results, stage3_result, metadata = await run_full_council(
-                request.content
+                council_input
             )
 
             # Stage 1: Individual responses

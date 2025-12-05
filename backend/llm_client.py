@@ -34,12 +34,14 @@ def parse_model_spec(spec: str) -> Tuple[str, str]:
         provider, model_name = spec.split(":", 1)
         provider = provider.strip().lower() or "openrouter"
         model_name = model_name.strip()
-    else:
-        provider = "openrouter"
-        model_name = spec
+        return provider, model_name
+
+    # No explicit provider: default to OpenRouter-style model identifier,
+    # e.g. "google/gemini-3-pro-preview".
+    provider = "openrouter"
+    model_name = spec
     return provider, model_name
-
-
+    
 async def _query_openrouter(
     model_name: str,
     messages: List[Dict[str, str]],
@@ -160,8 +162,14 @@ async def _query_qwen(model_name: str, messages: List[Dict[str, str]], timeout: 
 
 
 def _to_gemini_contents(messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Convert OpenAI-style messages into Gemini contents."""
+    """Convert OpenAI-style messages into Gemini contents.
+
+    System messages are inlined into the first user turn, and
+    consecutive turns with the same logical role are merged to avoid
+    producing long runs of identical roles.
+    """
     contents: List[Dict[str, Any]] = []
+
     for msg in messages:
         role = msg.get("role", "user")
         text = msg.get("content", "")
@@ -169,14 +177,23 @@ def _to_gemini_contents(messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
         if role == "assistant":
             g_role = "model"
         else:
+            # Inline any system messages into the user stream with a
+            # clear prefix so that Gemini can see the distinction.
+            if role == "system":
+                text = "[SYSTEM]\n" + text
             g_role = "user"
 
-        contents.append(
-            {
-                "role": g_role,
-                "parts": [{"text": text}],
-            }
-        )
+        if contents and contents[-1]["role"] == g_role:
+            # Merge consecutive turns for the same role.
+            contents[-1]["parts"][0]["text"] += "\n\n" + text
+        else:
+            contents.append(
+                {
+                    "role": g_role,
+                    "parts": [{"text": text}],
+                }
+            )
+
     return contents
 
 
@@ -212,8 +229,15 @@ async def _query_gemini(model_name: str, messages: List[Dict[str, str]], timeout
 
 
 def _to_anthropic_messages(messages: List[Dict[str, str]]) -> List[Dict[str, Any]]:
-    """Convert OpenAI-style messages into Anthropic messages."""
+    """Convert OpenAI-style messages into Anthropic messages.
+
+    System messages are inlined into the user stream and consecutive
+    turns with the same role are merged so that the sequence respects
+    Anthropic's expectations (alternating user/assistant where
+    possible) without adjacent duplicate roles.
+    """
     converted: List[Dict[str, Any]] = []
+
     for msg in messages:
         role = msg.get("role", "user")
         text = msg.get("content", "")
@@ -226,12 +250,16 @@ def _to_anthropic_messages(messages: List[Dict[str, str]]) -> List[Dict[str, Any
         if role not in ("user", "assistant"):
             role = "user"
 
-        converted.append(
-            {
-                "role": role,
-                "content": text,
-            }
-        )
+        if converted and converted[-1]["role"] == role:
+            converted[-1]["content"] += "\n\n" + text
+        else:
+            converted.append(
+                {
+                    "role": role,
+                    "content": text,
+                }
+            )
+
     return converted
 
 
@@ -292,7 +320,19 @@ async def query_model(
         A dict with at least a ``content`` field, or None on error.
     """
     provider, model_name = parse_model_spec(model_spec)
-    provider_fn = PROVIDERS.get(provider, _query_openrouter)
+    provider_fn = PROVIDERS.get(provider)
+
+    if provider_fn is None:
+        # Treat unknown providers as configuration errors rather than
+        # silently falling back to OpenRouter. This avoids confusing
+        # logs like provider 'google' hitting the OpenRouter endpoint
+        # and surfacing HTTP 400 errors at runtime.
+        known_providers = ", ".join(sorted(PROVIDERS.keys()))
+        print(
+            f"Config error for model spec '{model_spec}': unknown provider "
+            f"'{provider}'. Expected one of: {known_providers}."
+        )
+        return None
 
     try:
         return await provider_fn(model_name, messages, timeout)

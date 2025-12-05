@@ -8,6 +8,7 @@ selected filesystem content to LLM models.
 from __future__ import annotations
 
 import os
+import fnmatch
 from pathlib import Path
 from typing import List
 
@@ -95,13 +96,15 @@ def read_file_preview(path_str: str, max_bytes: int = 8192) -> str:
     return text
 
 
-def list_directory_tree(path_str: str, max_depth: int = 3, max_entries: int = 1000) -> str:
+def list_directory_tree(path_str: str, max_depth: int | None = None, max_entries: int | None = None) -> str:
     """Return a textual tree view of a directory within allowed roots.
 
     Args:
-        path_str: Directory path to list.
-        max_depth: Maximum directory depth to traverse (root is depth 0).
-        max_entries: Maximum number of entries to include overall.
+        path_str: Directory path to list (supports '~' via expanduser()).
+        max_depth: Optional maximum directory depth to traverse (root is depth 0).
+            If None, depth is unlimited.
+        max_entries: Optional maximum number of entries to include overall.
+            If None, entries are unlimited.
 
     Returns:
         A newline-separated tree view of the directory contents.
@@ -111,10 +114,15 @@ def list_directory_tree(path_str: str, max_depth: int = 3, max_entries: int = 10
         FileNotFoundError: If the path does not exist.
         NotADirectoryError: If the path is not a directory.
     """
-    path = Path(path_str)
+    raw_path = Path(path_str).expanduser()
 
-    if not is_path_allowed(path):
+    if not is_path_allowed(raw_path):
         raise PermissionError(f"Access to {path_str} is not allowed")
+
+    try:
+        path = raw_path.resolve()
+    except FileNotFoundError:
+        path = raw_path
 
     if not path.exists():
         raise FileNotFoundError(path_str)
@@ -129,7 +137,9 @@ def list_directory_tree(path_str: str, max_depth: int = 3, max_entries: int = 10
 
     def walk(current: Path, depth: int) -> None:
         nonlocal count
-        if depth > max_depth or count >= max_entries:
+        if max_depth is not None and depth > max_depth:
+            return
+        if max_entries is not None and count >= max_entries:
             return
 
         try:
@@ -142,7 +152,7 @@ def list_directory_tree(path_str: str, max_depth: int = 3, max_entries: int = 10
             return
 
         for entry in entries:
-            if count >= max_entries:
+            if max_entries is not None and count >= max_entries:
                 break
             indent = "  " * (depth + 1)
             if entry.is_dir():
@@ -156,7 +166,7 @@ def list_directory_tree(path_str: str, max_depth: int = 3, max_entries: int = 10
     walk(root, 0)
     if len(lines) == 1:
         lines.append("  (empty)")
-    elif count >= max_entries:
+    elif max_entries is not None and count >= max_entries:
         lines.append("  ...[truncated tree]...")
     return "\n".join(lines)
 
@@ -200,4 +210,148 @@ def write_text_file(path_str: str, content: str, overwrite: bool = False, max_by
     return str(path.resolve())
 
 
-__all__ = ["is_path_allowed", "read_file_preview", "list_directory_tree", "write_text_file"]
+def collect_codebase_preview(
+    path_str: str,
+    patterns: List[str] | None = None,
+    max_bytes_per_file: int = 8192,
+    max_files: int = 50,
+    max_depth: int | None = 8,
+    extra_ignore_dirs: List[str] | None = None,
+) -> str:
+    """Collect a bounded preview of source files under a directory.
+
+    This helper is designed to feed LLM prompts with a curated subset of
+    code files from a project directory, while remaining safe and
+    resource-conscious.
+
+    Args:
+        path_str: Root directory to scan.
+        patterns: Optional list of glob patterns (e.g. ["*.py", "*.tsx"]).
+            If None, a reasonable default set of code/text patterns is used.
+        max_bytes_per_file: Maximum bytes to read from each file.
+        max_files: Maximum number of files to include.
+        max_depth: Maximum directory depth relative to the root (root is 0).
+        extra_ignore_dirs: Additional directory names to ignore.
+
+    Returns:
+        A UTF-8 text block containing file headings and previews.
+
+    Raises:
+        PermissionError: If the root path is outside allowed roots.
+        FileNotFoundError: If the root path does not exist.
+        NotADirectoryError: If the root path is not a directory.
+    """
+    raw_path = Path(path_str).expanduser()
+
+    if not is_path_allowed(raw_path):
+        raise PermissionError(f"Access to {path_str} is not allowed")
+
+    try:
+        root = raw_path.resolve()
+    except FileNotFoundError:
+        root = raw_path
+
+    if not root.exists():
+        raise FileNotFoundError(path_str)
+
+    if not root.is_dir():
+        # For a single file, just return its preview directly.
+        preview = read_file_preview(str(root), max_bytes=max_bytes_per_file)
+        rel_name = root.name
+        return f"### {rel_name}\n{preview}\n"
+
+    if patterns is None or not patterns:
+        patterns = [
+            "*.py",
+            "*.pyi",
+            "*.js",
+            "*.jsx",
+            "*.ts",
+            "*.tsx",
+            "*.json",
+            "*.toml",
+            "*.md",
+            "*.rst",
+        ]
+
+    ignore_dirs = {
+        "node_modules",
+        ".git",
+        ".hg",
+        ".svn",
+        ".idea",
+        ".vscode",
+        "__pycache__",
+        ".venv",
+        "venv",
+        "env",
+        "dist",
+        "build",
+    }
+    if extra_ignore_dirs:
+        ignore_dirs.update(extra_ignore_dirs)
+
+    lines: List[str] = []
+    files_seen = 0
+
+    root_parts = root.parts
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        # Compute depth relative to root.
+        current_parts = Path(dirpath).parts
+        depth = max(0, len(current_parts) - len(root_parts))
+        if max_depth is not None and depth > max_depth:
+            dirnames[:] = []
+            continue
+
+        # Filter directories in-place: skip hidden and ignored names.
+        dirnames[:] = [
+            d
+            for d in dirnames
+            if not d.startswith(".") and d not in ignore_dirs
+        ]
+
+        rel_dir = Path(dirpath).relative_to(root)
+
+        for name in filenames:
+            if files_seen >= max_files:
+                break
+
+            # Skip hidden files.
+            if name.startswith("."):
+                continue
+
+            rel_path = rel_dir / name if str(rel_dir) != "." else Path(name)
+            rel_str = str(rel_path)
+
+            if not any(fnmatch.fnmatch(rel_str, pat) or fnmatch.fnmatch(name, pat) for pat in patterns):
+                continue
+
+            file_path = Path(dirpath) / name
+            try:
+                preview = read_file_preview(str(file_path), max_bytes=max_bytes_per_file)
+            except Exception:
+                # Skip files that cannot be read; keep going.
+                continue
+
+            lines.append(f"### {rel_str}")
+            lines.append(preview.rstrip())
+            lines.append("")
+            files_seen += 1
+
+        if files_seen >= max_files:
+            break
+
+    if not lines:
+        return "(no matching files found)\n"
+
+    return "\n".join(lines).rstrip() + "\n"
+
+
+__all__ = [
+    "is_path_allowed",
+    "read_file_preview",
+    "list_directory_tree",
+    "write_text_file",
+    "collect_codebase_preview",
+]

@@ -63,7 +63,7 @@ GEMINI_API_BASE = os.getenv(
 
 # Anthropic
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY")
-ANTHROPIC_API_BASE = os.getenv("ANTHROPIC_API_BASE", "https://api.anthropic.com")
+ANTHROPIC_API_BASE = os.getenv("ANTHROPIC_API_BASE", "https://openrouter.ai/api/v1")
 # Anthropic API version is driven purely by environment configuration.
 ANTHROPIC_API_VERSION = os.getenv("ANTHROPIC_API_VERSION")
 ANTHROPIC_DEFAULT_MAX_TOKENS = int(os.getenv("ANTHROPIC_DEFAULT_MAX_TOKENS", "1024"))

@@ -10,7 +10,8 @@ def test_data_dir_default_under_council_home(monkeypatch, tmp_path):
     monkeypatch.setenv("HOME", str(tmp_path))
 
     from backend import config as config_module
-
+    # Avoid picking up values from a real .env during this test.
+    monkeypatch.setattr(config_module, "load_dotenv", lambda: None)
     importlib.reload(config_module)
 
     expected_home = os.path.expanduser("~/.llm-council")

@@ -72,3 +72,66 @@ async def test_query_model_returns_none_on_http_401(monkeypatch):
         [{"role": "user", "content": "hi"}],
     )
     assert result is None
+
+
+def test_to_anthropic_messages_merges_consecutive_roles_and_inlines_system():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "user", "content": "u2"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "assistant", "content": "a2"},
+        {"role": "tool", "content": "tool-msg"},
+    ]
+
+    converted = llm_client._to_anthropic_messages(messages)
+
+    # Expect three messages:
+    # 1. user: system + both user messages merged
+    # 2. assistant: both assistant messages merged
+    # 3. user: tool message (normalized to user)
+    assert len(converted) == 3
+
+    first = converted[0]
+    assert first["role"] == "user"
+    assert "[SYSTEM]" in first["content"]
+    assert "sys" in first["content"]
+    assert "u1" in first["content"]
+    assert "u2" in first["content"]
+
+    second = converted[1]
+    assert second["role"] == "assistant"
+    assert "a1" in second["content"]
+    assert "a2" in second["content"]
+
+    third = converted[2]
+    assert third["role"] == "user"
+    assert "tool-msg" in third["content"]
+
+
+def test_to_gemini_contents_normalizes_roles_and_merges_consecutive():
+    messages = [
+        {"role": "system", "content": "sys"},
+        {"role": "user", "content": "u1"},
+        {"role": "assistant", "content": "a1"},
+        {"role": "assistant", "content": "a2"},
+    ]
+
+    contents = llm_client._to_gemini_contents(messages)
+
+    # System + first user message become a single "user" turn,
+    # assistants are merged into a single "model" turn.
+    assert len(contents) == 2
+
+    first = contents[0]
+    assert first["role"] == "user"
+    user_text = first["parts"][0]["text"]
+    assert "[SYSTEM]" in user_text
+    assert "sys" in user_text
+    assert "u1" in user_text
+
+    second = contents[1]
+    assert second["role"] == "model"
+    model_text = second["parts"][0]["text"]
+    assert "a1" in model_text
+    assert "a2" in model_text

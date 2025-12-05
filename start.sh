@@ -5,4 +5,4 @@
 echo "Starting LLM Council (terminal mode)..."
 echo ""
 
-uv run python -m backend.cli
+uv run python -m backend.cli "$@"
