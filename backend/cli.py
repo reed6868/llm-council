@@ -45,6 +45,15 @@ class ActiveProject:
     root: Path
 
 
+def _derive_project_id_from_path(path_str: str) -> str:
+    """Derive a stable, human-readable project id from a filesystem path."""
+    p = Path(path_str)
+    name = p.name or "project"
+    # Keep only a safe subset of characters for the id.
+    safe = re.sub(r"[^A-Za-z0-9_\-]", "_", name)
+    return f"auto_{safe}"
+
+
 def parse_special_command(line: str) -> Optional[str]:
     """Parse a user line that may represent a special command.
 
@@ -307,7 +316,19 @@ def expand_codebase_placeholders(text: str) -> str:
                 extra_ignore_dirs=extra_ignore_dirs,
             )
             label = f"[CODEBASE {raw_path}]"
-            return f"\n\n{label}\n{code}\n\n"
+
+            # Wrap the codebase preview in a lightweight project context
+            # so that downstream prompts can reason about it using the
+            # same PROJECT ROOT/PATH/CODEBASE protocol as the active
+            # project context.
+            project_id = _derive_project_id_from_path(raw_path)
+            prefix_lines = [
+                f"[PROJECT ROOT] <project:{project_id}>",
+                f"[PROJECT PATH] {raw_path}",
+                "[PROJECT CODEBASE]",
+            ]
+            prefix = "\n".join(prefix_lines)
+            return f"\n\n{prefix}\n{label}\n{code}\n\n"
         except Exception as e:
             return f"[Error collecting codebase {raw_path}: {e}]"
 

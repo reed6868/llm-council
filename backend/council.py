@@ -1,10 +1,96 @@
 """3-stage LLM Council orchestration."""
 
+from dataclasses import dataclass
 from typing import List, Dict, Any, Tuple, Optional
 
 from .llm_client import query_models_parallel, query_model
 from .config import COUNCIL_MODELS, CHAIRMAN_MODEL, TITLE_MODEL
 from .council_config import load_council_config
+
+
+@dataclass
+class ProjectContextInfo:
+    """Structured view of project context sections present in a prompt."""
+
+    project_id: Optional[str]
+    path: Optional[str]
+    has_tree: bool = False
+    tree_error: bool = False
+    has_code: bool = False
+    code_error: bool = False
+
+
+def _extract_project_contexts(user_query: str) -> List[ProjectContextInfo]:
+    """Extract project context blocks from the unified user query text.
+
+    This inspects lines that look like:
+    - [PROJECT ROOT] <project:some-id> or [PROJECT ROOT] /path
+    - [PROJECT PATH] /path
+    - [PROJECT TREE]
+      ... or [Error collecting project tree: ...]
+    - [PROJECT CODEBASE]
+      ... or [Error collecting project codebase: ...]
+    """
+    contexts: List[ProjectContextInfo] = []
+    current: Optional[ProjectContextInfo] = None
+
+    for raw_line in user_query.splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        if line.startswith("[PROJECT ROOT]"):
+            # Start a new context block.
+            project_id: Optional[str] = None
+            if "<project:" in line and ">" in line:
+                start = line.find("<project:") + len("<project:")
+                end = line.find(">", start)
+                if end > start:
+                    project_id = line[start:end].strip() or None
+            current = ProjectContextInfo(project_id=project_id, path=None)
+            contexts.append(current)
+            continue
+
+        if current is None:
+            continue
+
+        if line.startswith("[PROJECT PATH]"):
+            # Everything after the marker is treated as the path string.
+            path = line[len("[PROJECT PATH]") :].strip()
+            current.path = path or current.path
+        elif line.startswith("[PROJECT TREE]"):
+            current.has_tree = True
+        elif line.startswith("[PROJECT CODEBASE]"):
+            current.has_code = True
+        elif line.startswith("[Error collecting project tree:"):
+            current.tree_error = True
+        elif line.startswith("[Error collecting project codebase:"):
+            current.code_error = True
+
+    return contexts
+
+
+def _summarize_project_contexts(user_query: str) -> str:
+    """Produce a short, human-readable summary of available project contexts."""
+    contexts = _extract_project_contexts(user_query)
+    if not contexts:
+        return "Project context availability: none detected."
+
+    lines: List[str] = ["Project context availability:"]
+    for ctx in contexts:
+        label: str
+        if ctx.project_id:
+            label = f"project:{ctx.project_id}"
+        elif ctx.path:
+            label = ctx.path
+        else:
+            label = "<unknown-project>"
+
+        has_reliable_code = ctx.has_code and not ctx.code_error
+        status = "code context AVAILABLE" if has_reliable_code else "NO reliable code context"
+        lines.append(f"- {label}: {status}")
+
+    return "\n".join(lines)
 
 
 async def stage1_collect_responses(
@@ -133,7 +219,7 @@ async def stage3_synthesize_final(
     Stage 3: Chairman synthesizes final response.
 
     Args:
-        user_query: The original user query
+        user_query: The unified user query (including any project context)
         stage1_results: Individual model responses from Stage 1
         stage2_results: Rankings from Stage 2
 
@@ -151,7 +237,11 @@ async def stage3_synthesize_final(
         for result in stage2_results
     ])
 
+    project_ctx_summary = _summarize_project_contexts(user_query)
+
     chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
+
+{project_ctx_summary}
 
 The original question text may include one or more project context sections that look like:
 - [PROJECT ROOT] <project:some-id>
