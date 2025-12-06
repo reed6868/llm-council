@@ -217,6 +217,23 @@ def test_parse_path_command_ignores_non_path_lines(monkeypatch):
     assert cli.parse_path_command(":codex") is None
 
 
+def test_parse_project_command_recognizes_valid_command(monkeypatch, tmp_path):
+    import backend.cli as cli
+
+    root = tmp_path / "repo"
+    root.mkdir()
+
+    # Allow the temporary repo path.
+    monkeypatch.setattr(cli.fs_tools, "is_path_allowed", lambda p: True)
+
+    cmd = f"[[project:proj|path={root}]]"
+    project = cli.parse_project_command(cmd)
+
+    assert project is not None
+    assert project.project_id == "proj"
+    assert project.root == root.resolve()
+
+
 def test_scan_project_path_uses_build_project_context(monkeypatch, tmp_path):
     import backend.cli as cli
 
@@ -265,7 +282,7 @@ def test_enrich_content_with_path_placeholders_injects_placeholders_for_first_me
     # Allow the temporary repo path.
     monkeypatch.setattr(cli.fs_tools, "is_path_allowed", lambda p: True)
 
-    content = f"iterate through{root}repo,summarize the project no more than 10 sentences"
+    content = f"iterate through {root} summarize the project no more than 10 sentences"
 
     enriched = cli.enrich_content_with_path_placeholders(
         content,
@@ -391,8 +408,8 @@ async def test_run_session_one_shot_calls_handler_once_and_exits(monkeypatch):
 
     calls = {"messages": []}
 
-    async def fake_handle(conversation_id, content, summary_only=False):
-        calls["messages"].append((conversation_id, content, summary_only))
+    async def fake_handle(conversation_id, content, summary_only=False, active_project=None):
+        calls["messages"].append((conversation_id, content, summary_only, active_project))
 
     monkeypatch.setattr(cli, "_handle_user_message", fake_handle)
 
@@ -401,9 +418,11 @@ async def test_run_session_one_shot_calls_handler_once_and_exits(monkeypatch):
 
     # Assert: handler was called once with summary_only=True.
     assert len(calls["messages"]) == 1
-    _, content, summary_only = calls["messages"][0]
+    _, content, summary_only, active_project = calls["messages"][0]
     assert content == "audit once"
     assert summary_only is True
+    # Active project should be provided to the handler.
+    assert active_project is not None
 
 
 @pytest.mark.asyncio
@@ -427,8 +446,8 @@ async def test_handle_user_message_summary_only_wraps_audit_prompt(monkeypatch, 
     # Prepare_council_input should see the wrapped audit prompt.
     seen_inputs = []
 
-    def fake_prepare_council_input(content: str, is_first_message: bool) -> str:
-        seen_inputs.append((content, is_first_message))
+    def fake_prepare_council_input(content: str, is_first_message: bool, project_ctx=None) -> str:
+        seen_inputs.append((content, is_first_message, project_ctx))
         # Return the content unchanged so run_full_council receives it.
         return content
 
@@ -441,14 +460,14 @@ async def test_handle_user_message_summary_only_wraps_audit_prompt(monkeypatch, 
     monkeypatch.setattr(cli.council, "run_full_council", fake_run_full_council)
 
     # Act: first message in summary-only (audit) mode.
-    await cli._handle_user_message("conv-1", "please audit", summary_only=True)
+    await cli._handle_user_message("conv-1", "please audit", summary_only=True, active_project=None)
 
     # Assert: prepare_council_input saw an audit-wrapped prompt that
     # includes both the audit preamble and the original content.
     assert seen_inputs
-    wrapped_content, first_flag = seen_inputs[0]
+    wrapped_content, first_flag, project_ctx = seen_inputs[0]
     assert first_flag is True
-    assert "auditing the *current local llm-council codebase*" in wrapped_content
+    assert "auditing the *current active project codebase*" in wrapped_content
     assert "please audit" in wrapped_content
 
     # Only the chairman summary should be printed.

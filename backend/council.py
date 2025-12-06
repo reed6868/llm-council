@@ -153,7 +153,25 @@ async def stage3_synthesize_final(
 
     chairman_prompt = f"""You are the Chairman of an LLM Council. Multiple AI models have provided responses to a user's question, and then ranked each other's responses.
 
-Original Question: {user_query}
+The original question text may include one or more project context sections that look like:
+- [PROJECT ROOT] <project:some-id>
+- [PROJECT PATH] /some/filesystem/path
+- [PROJECT TREE]
+  (directory listing)
+- [PROJECT CODEBASE]
+  (file previews)
+
+Treat these PROJECT ROOT/TREE/CODEBASE sections as the ONLY reliable evidence about any codebase or filesystem path. You MUST:
+- Base any statements about specific projects, repositories, or code only on these sections.
+- Refer to projects by their logical handle (for example "project:some-id") rather than claiming direct access to raw filesystem paths.
+- NOT claim that you have "traversed", "loaded", or "inspected" a repository or path unless it appears in a [PROJECT ROOT]/[PROJECT PATH] block with corresponding TREE/CODEBASE content.
+- Treat any lines like "[Error collecting project tree: ...]" or "[Error collecting project codebase: ...]" as meaning that code for that project is NOT available.
+
+When many Stage 1 models explicitly say that they cannot access a path or repository (for example messages containing phrases like "cannot access", "无法访问", or similar), you must treat this as strong evidence that the council as a whole lacks filesystem access. In such cases:
+- Do NOT invent details about unseen code or repositories.
+- Clearly state that the council does not have direct access to the requested codebase and that any high-level comments are necessarily generic or speculative.
+
+Original Question (including any project context): {user_query}
 
 STAGE 1 - Individual Responses:
 {stage1_text}
@@ -165,6 +183,8 @@ Your task as Chairman is to synthesize all of this information into a single, co
 - The individual responses and their insights
 - The peer rankings and what they reveal about response quality
 - Any patterns of agreement or disagreement
+
+If the council lacks reliable project context for a requested codebase, your final answer MUST clearly explain this limitation and avoid pretending to have inspected that code.
 
 Provide a clear, well-reasoned final answer that represents the council's collective wisdom:"""
 

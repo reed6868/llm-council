@@ -10,6 +10,7 @@ import subprocess
 import uuid
 from pathlib import Path
 from typing import Optional
+from dataclasses import dataclass
 
 from . import council, storage, fs_tools, project_context
 from .council_config import load_council_config
@@ -33,6 +34,15 @@ _TREE_PATTERN = re.compile(r"\[\[tree:([^\]]+)\]\]")
 _WRITE_PATTERN = re.compile(r"\[\[write:([^|]+)\|([^\]]*)\]\]")
 _CODEBASE_PATTERN = re.compile(r"\[\[codebase:([^|\]]+)(?:\|([^\]]+))?\]\]")
 _PATH_IN_TEXT_PATTERN = re.compile(r"(?P<path>(?:~|/)[A-Za-z0-9_\-./]+)")
+_PROJECT_COMMAND_PATTERN = re.compile(r"\[\[project:([^|\]]+)(?:\|([^\]]+))?\]\]")
+
+
+@dataclass
+class ActiveProject:
+    """Logical project handle for the current session."""
+
+    project_id: str
+    root: Path
 
 
 def parse_special_command(line: str) -> Optional[str]:
@@ -48,6 +58,46 @@ def parse_special_command(line: str) -> Optional[str]:
     if command in ("codex", "claude", "gemini", "exit"):
         return command
     return None
+
+
+def parse_project_command(line: str) -> Optional[ActiveProject]:
+    """Parse a project switch command of the form [[project:id|path=/abs/path]]."""
+    stripped = line.strip()
+    if not stripped:
+        return None
+
+    match = _PROJECT_COMMAND_PATTERN.fullmatch(stripped)
+    if not match:
+        return None
+
+    project_id = match.group(1).strip() or "default"
+    options_str = (match.group(2) or "").strip()
+
+    project_path: Path | None = None
+    if options_str:
+        for segment in options_str.split("|"):
+            segment = segment.strip()
+            if not segment or "=" not in segment:
+                continue
+            key, value = segment.split("=", 1)
+            if key.strip().lower() == "path":
+                project_path = Path(value.strip()).expanduser()
+                break
+
+    if project_path is None:
+        print("Project command is missing a 'path=/abs/path' option.")
+        return None
+
+    try:
+        resolved = project_path.resolve()
+    except OSError:
+        resolved = project_path
+
+    if not fs_tools.is_path_allowed(resolved):
+        print(f"Access to project path {resolved} is not allowed.")
+        return None
+
+    return ActiveProject(project_id=project_id, root=resolved)
 
 
 def parse_path_command(line: str) -> Optional[Path]:
@@ -284,7 +334,11 @@ def apply_write_placeholders(text: str) -> str:
     return _WRITE_PATTERN.sub(_replace, text)
 
 
-def prepare_council_input(content: str, is_first_message: bool) -> str:
+def prepare_council_input(
+    content: str,
+    is_first_message: bool,
+    project_ctx: str | None = None,
+) -> str:
     """Prepare the final text that will be sent to the council.
 
     This applies placeholder processing to the user content and, for the
@@ -299,10 +353,12 @@ def prepare_council_input(content: str, is_first_message: bool) -> str:
     if not is_first_message:
         return processed
 
-    try:
-        ctx = project_context.build_initial_project_context()
-    except Exception as e:
-        ctx = f"[Error building project context: {e}]"
+    ctx = project_ctx
+    if ctx is None:
+        try:
+            ctx = project_context.build_initial_project_context()
+        except Exception as e:
+            ctx = f"[Error building project context: {e}]"
 
     return f"{ctx}\n\n{processed}"
 
@@ -311,6 +367,7 @@ async def _handle_user_message(
     conversation_id: str,
     content: str,
     summary_only: bool = False,
+    active_project: ActiveProject | None = None,
 ) -> None:
     """Run the full council pipeline for a single user message.
 
@@ -336,7 +393,7 @@ async def _handle_user_message(
     effective_content = content
     if summary_only and is_first_message:
         effective_content = (
-            "You are auditing the *current local llm-council codebase* whose "
+            "You are auditing the *current active project codebase* whose "
             "project context (PROJECT ROOT/TREE/CODEBASE) is included above.\n"
             "Your answer MUST:\n"
             "- Ground every finding in specific files or modules that exist in this repository "
@@ -358,10 +415,26 @@ async def _handle_user_message(
         is_first_message=is_first_message,
     )
 
+    project_ctx: str | None = None
+    if is_first_message and active_project is not None:
+        try:
+            project_ctx = project_context.build_project_context(
+                active_project.root,
+                max_tree_depth=3,
+                max_tree_entries=200,
+                code_kwargs={"project_id": active_project.project_id},
+            )
+        except Exception as e:
+            project_ctx = f"[Error building project context: {e}]"
+
     # Prepare the full council input. For the first message in a
     # conversation, this includes a project context summary describing
     # the local codebase; subsequent messages only process placeholders.
-    council_input = prepare_council_input(enriched_content, is_first_message)
+    council_input = prepare_council_input(
+        enriched_content,
+        is_first_message,
+        project_ctx=project_ctx,
+    )
 
     stage1_results, stage2_results, stage3_result, metadata = await council.run_full_council(
         council_input
@@ -452,6 +525,14 @@ async def _run_session(conversation_id: Optional[str], one_shot: bool = False) -
         # Config summary is best-effort; do not block the session.
         print(f"Warning: failed to load council configuration: {e}")
 
+    # Initialize the active project for this session.
+    try:
+        default_root = project_context.resolve_project_root()
+    except Exception:
+        default_root = Path.cwd().resolve()
+    active_project = ActiveProject(project_id="default", root=default_root)
+    print(f"Active project: <project:{active_project.project_id}> at {active_project.root}")
+
     print("Type your message and press Enter.")
     print("Use :codex / :claude / :gemini to launch external CLIs, :exit to quit.")
     if one_shot:
@@ -477,6 +558,16 @@ async def _run_session(conversation_id: Optional[str], one_shot: bool = False) -
             run_external_cli(command)
             continue
 
+        # Handle project switch commands of the form [[project:id|path=/abs/path]].
+        project_cmd = parse_project_command(line)
+        if project_cmd is not None:
+            active_project = project_cmd
+            print(f"Switched active project to <project:{active_project.project_id}> at {active_project.root}")
+            if one_shot:
+                print("One-shot session complete. Exiting.")
+                break
+            continue
+
         # Handle a bare path line as a project scan command when applicable.
         path_context = handle_path_line(line)
         if path_context is not None:
@@ -486,7 +577,12 @@ async def _run_session(conversation_id: Optional[str], one_shot: bool = False) -
                 break
             continue
 
-        await _handle_user_message(conversation_id, line, summary_only=one_shot)
+        await _handle_user_message(
+            conversation_id,
+            line,
+            summary_only=one_shot,
+            active_project=active_project,
+        )
         if one_shot:
             print("One-shot session complete. Exiting.")
             break

@@ -34,11 +34,24 @@ def build_project_context(
     """Build a textual summary of a project rooted at the given path.
 
     The summary includes:
-    - project root path
+    - project root identifier (and optional path)
     - a directory tree view (bounded by depth and entry count when provided)
     - a codebase preview using fs_tools.collect_codebase_preview()
     """
-    sections: list[str] = [f"[PROJECT ROOT] {root}"]
+    sections: list[str] = []
+
+    # When a logical project identifier is available, surface it as the
+    # primary handle for models, while still exposing the concrete path
+    # for human operators. The identifier is passed via code_kwargs to
+    # avoid changing the public function signature.
+    effective_kwargs = dict(code_kwargs) if code_kwargs else {}
+    project_id = effective_kwargs.pop("project_id", None)
+
+    if project_id:
+        sections.append(f"[PROJECT ROOT] <project:{project_id}>")
+        sections.append(f"[PROJECT PATH] {root}")
+    else:
+        sections.append(f"[PROJECT ROOT] {root}")
 
     try:
         tree = fs_tools.list_directory_tree(
@@ -52,7 +65,7 @@ def build_project_context(
         sections.append(f"[Error collecting project tree: {e}]")
 
     try:
-        kwargs = code_kwargs or {}
+        kwargs = effective_kwargs
         code = fs_tools.collect_codebase_preview(str(root), **kwargs)
         sections.append("[PROJECT CODEBASE]")
         sections.append(code)
